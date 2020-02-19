@@ -17,7 +17,6 @@
 
 import logging
 from sys import stderr, hexversion
-logging.basicConfig(stream=stderr)
 
 import hmac
 from hashlib import sha1
@@ -29,8 +28,24 @@ from os.path import isfile, abspath, normpath, dirname, join, basename
 
 import requests
 from ipaddress import ip_address, ip_network
-from flask import Flask, request, abort
+from flask import Flask, request, abort, jsonify
 
+# Python prior to 2.7.7 does not have hmac.compare_digest
+if hexversion >= 0x020707F0:
+    def constant_time_compare(val1, val2):
+        return hmac.compare_digest(val1, val2)
+else:
+    def constant_time_compare(val1, val2):
+        if len(val1) != len(val2):
+            return False
+        result = 0
+        for x, y in zip(val1, val2):
+            result |= ord(x) ^ ord(y)
+        return result == 0
+
+logging.basicConfig(stream=stderr)
+# If you need troubleshooting logs, comment the previous line and uncomment the next one
+# logging.basicConfig(filename='/opt/python-github-webhooks/hooks.log', level=10)
 
 application = Flask(__name__)
 
@@ -45,11 +60,20 @@ def index():
 
     # Only POST is implemented
     if request.method != 'POST':
-        abort(501)
+        abort(405)
 
     # Load config
-    with open(join(path, 'config.json'), 'r') as cfg:
-        config = loads(cfg.read())
+    if isfile(join(path, 'config.json')):
+        with open(join(path, 'config.json'), 'r') as cfg:
+            config = loads(cfg.read())
+    else:
+        # abort(503, 'Configuration file config.json is missing.')
+        config = {
+            "github_ips_only": False,
+            "enforce_secret": "",
+            "return_scripts_info": False,
+            "hooks_path": "/missing"
+        }
 
     hooks = config.get('hooks_path', join(path, 'hooks'))
 
@@ -75,25 +99,20 @@ def index():
         # Only SHA1 is supported
         header_signature = request.headers.get('X-Hub-Signature')
         if header_signature is None:
+            logging.warning("No signature found when expecting one")
             abort(403)
 
         sha_name, signature = header_signature.split('=')
         if sha_name != 'sha1':
+            logging.warning("Unsupported signature mech: {}".format(sha_name))
             abort(501)
 
         # HMAC requires the key to be bytes, but data is string
-        mac = hmac.new(str(secret), msg=request.data, digestmod='sha1')
+        mac = hmac.new(bytes(secret,'utf-8'), msg=request.data, digestmod=sha1)
 
-        # Python prior to 2.7.7 does not have hmac.compare_digest
-        if hexversion >= 0x020707F0:
-            if not hmac.compare_digest(str(mac.hexdigest()), str(signature)):
-                abort(403)
-        else:
-            # What compare_digest provides is protection against timing
-            # attacks; we can live without this protection for a web-based
-            # application
-            if not str(mac.hexdigest()) == str(signature):
-                abort(403)
+        if not constant_time_compare(str(mac.hexdigest()), str(signature)):
+            logging.warning("Invalid digest comparison")
+            abort(403)
 
     # Implement ping
     event = request.headers.get('X-GitHub-Event', 'ping')
@@ -104,7 +123,7 @@ def index():
     try:
         payload = request.get_json()
     except Exception:
-        logging.warning('Request parsing failed')
+        logging.warning('Request parsing failed with exception {}'.format(Exception))
         abort(400)
 
     # Determining the branch is tricky, as it only appears for certain event
@@ -152,11 +171,19 @@ def index():
     # Possible hooks
     scripts = []
     if branch and name:
+        logging.info('Trying: {event}-{name}-{branch}'.format(**meta))
+        logging.info('Trying: {event}-{name}-{branch}-background'.format(**meta))
         scripts.append(join(hooks, '{event}-{name}-{branch}'.format(**meta)))
+        scripts.append(join(hooks, '{event}-{name}-{branch}-background'.format(**meta)))
     if name:
+        logging.info('Trying: {event}-{name}'.format(**meta))
+        logging.info('Trying: {event}-{name}-background'.format(**meta))
         scripts.append(join(hooks, '{event}-{name}'.format(**meta)))
+        scripts.append(join(hooks, '{event}-{name}-background'.format(**meta)))
     scripts.append(join(hooks, '{event}'.format(**meta)))
+    scripts.append(join(hooks, '{event}-background'.format(**meta)))
     scripts.append(join(hooks, 'all'))
+    scripts.append(join(hooks, 'all-background'))
 
     # Check permissions
     scripts = [s for s in scripts if isfile(s) and access(s, X_OK)]
@@ -172,23 +199,41 @@ def index():
     ran = {}
     for s in scripts:
 
-        proc = Popen(
-            [s, tmpfile, event],
-            stdout=PIPE, stderr=PIPE
-        )
-        stdout, stderr = proc.communicate()
+        if s.endswith('-background'):
+            # each backgrounded script gets its own tempfile
+            # in this case, the backgrounded script MUST clean up after this!!!
+            # the per-job tempfile will NOT be deleted here!
+            osfd2, tmpfile2 = mkstemp()
+            with fdopen(osfd2, 'w') as pf2:
+                pf2.write(dumps(payload))
 
-        ran[basename(s)] = {
-            'returncode': proc.returncode,
-            'stdout': stdout.decode('utf-8'),
-            'stderr': stderr.decode('utf-8'),
-        }
+            proc = Popen(
+                [s, tmpfile2, event, str(name), str(branch)],
+                stdout=PIPE, stderr=PIPE
+            )
 
-        # Log errors if a hook failed
-        if proc.returncode != 0:
-            logging.error('{} : {} \n{}'.format(
-                s, proc.returncode, stderr
-            ))
+            ran[basename(s)] = {
+                'backgrounded': 'yes'
+            }
+
+        else:
+            proc = Popen(
+                [s, tmpfile, event, str(name), str(branch)],
+                stdout=PIPE, stderr=PIPE
+            )
+            stdout, stderr = proc.communicate()
+
+            ran[basename(s)] = {
+                'returncode': proc.returncode,
+                'stdout': stdout.decode('utf-8'),
+                'stderr': stderr.decode('utf-8'),
+            }
+
+            # Log errors if a hook failed
+            if proc.returncode != 0:
+                logging.error('{} : {} \n{}'.format(
+                    s, proc.returncode, stderr
+                ))
 
     # Remove temporal file
     remove(tmpfile)
@@ -201,6 +246,9 @@ def index():
     logging.info(output)
     return output
 
+@application.route('/status', methods=['GET'])
+def status():
+    return jsonify({'status': 'ok'})
 
 if __name__ == '__main__':
     application.run(debug=True, host='0.0.0.0')
